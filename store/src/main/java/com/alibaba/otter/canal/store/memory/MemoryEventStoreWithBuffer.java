@@ -7,6 +7,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
+import org.apache.commons.lang.StringUtils;
+
 import com.alibaba.otter.canal.protocol.CanalEntry;
 import com.alibaba.otter.canal.protocol.CanalEntry.EventType;
 import com.alibaba.otter.canal.protocol.position.LogPosition;
@@ -37,14 +39,14 @@ public class MemoryEventStoreWithBuffer extends AbstractCanalStoreScavenge imple
 
     private static final long INIT_SEQUENCE = -1;
     private int               bufferSize    = 16 * 1024;
-    private int               bufferMemUnit = 1024;                         // memsize的单位，默认为1kb大小
+    private int               bufferMemUnit = 1024;                                      // memsize的单位，默认为1kb大小
     private int               indexMask;
     private Event[]           entries;
 
     // 记录下put/get/ack操作的三个下标
-    private AtomicLong        putSequence   = new AtomicLong(INIT_SEQUENCE); // 代表当前put操作最后一次写操作发生的位置
-    private AtomicLong        getSequence   = new AtomicLong(INIT_SEQUENCE); // 代表当前get操作读取的最后一条的位置
-    private AtomicLong        ackSequence   = new AtomicLong(INIT_SEQUENCE); // 代表当前ack操作的最后一条的位置
+    private AtomicLong        putSequence   = new AtomicLong(INIT_SEQUENCE);             // 代表当前put操作最后一次写操作发生的位置
+    private AtomicLong        getSequence   = new AtomicLong(INIT_SEQUENCE);             // 代表当前get操作读取的最后一条的位置
+    private AtomicLong        ackSequence   = new AtomicLong(INIT_SEQUENCE);             // 代表当前ack操作的最后一条的位置
 
     // 记录下put/get/ack操作的三个memsize大小
     private AtomicLong        putMemSize    = new AtomicLong(0);
@@ -66,8 +68,9 @@ public class MemoryEventStoreWithBuffer extends AbstractCanalStoreScavenge imple
     private Condition         notFull       = lock.newCondition();
     private Condition         notEmpty      = lock.newCondition();
 
-    private BatchMode         batchMode     = BatchMode.ITEMSIZE;           // 默认为内存大小模式
+    private BatchMode         batchMode     = BatchMode.ITEMSIZE;                        // 默认为内存大小模式
     private boolean           ddlIsolation  = false;
+    private boolean           raw           = true;                                      // 针对entry是否开启raw模式
 
     public MemoryEventStoreWithBuffer(){
 
@@ -331,11 +334,13 @@ public class MemoryEventStoreWithBuffer extends AbstractCanalStoreScavenge imple
 
         range.setStart(CanalEventUtils.createPosition(entrys.get(0)));
         range.setEnd(CanalEventUtils.createPosition(entrys.get(result.getEvents().size() - 1)));
+        range.setEndSeq(end);
         // 记录一下是否存在可以被ack的点
 
         for (int i = entrys.size() - 1; i >= 0; i--) {
             Event event = entrys.get(i);
-            if (CanalEntry.EntryType.TRANSACTIONBEGIN == event.getEntryType()
+            // GTID模式,ack的位点必须是事务结尾,因为下一次订阅的时候mysql会发送这个gtid之后的next,如果在事务头就记录了会丢这最后一个事务
+            if ((CanalEntry.EntryType.TRANSACTIONBEGIN == event.getEntryType() && StringUtils.isEmpty(event.getGtid()))
                 || CanalEntry.EntryType.TRANSACTIONEND == event.getEntryType() || isDdl(event.getEventType())) {
                 // 将事务头/尾设置可被为ack的点
                 range.setAck(CanalEventUtils.createPosition(event));
@@ -365,9 +370,9 @@ public class MemoryEventStoreWithBuffer extends AbstractCanalStoreScavenge imple
                 return CanalEventUtils.createPosition(event, false);
             } else if (firstSeqeuence > INIT_SEQUENCE && firstSeqeuence < putSequence.get()) {
                 // ack未追上put操作
-                Event event = entries[getIndex(firstSeqeuence + 1)]; // 最后一次ack的位置数据
-                                                                     // + 1
-                return CanalEventUtils.createPosition(event, true);
+                Event event = entries[getIndex(firstSeqeuence)]; // 最后一次ack的位置数据,需要移动到下一条,included
+                // = false
+                return CanalEventUtils.createPosition(event, false);
             } else if (firstSeqeuence > INIT_SEQUENCE && firstSeqeuence == putSequence.get()) {
                 // 已经追上，store中没有数据
                 Event event = entries[getIndex(firstSeqeuence)]; // 最后一次ack的位置数据，和last为同一条，included
@@ -406,10 +411,19 @@ public class MemoryEventStoreWithBuffer extends AbstractCanalStoreScavenge imple
     }
 
     public void ack(Position position) throws CanalStoreException {
-        cleanUntil(position);
+        cleanUntil(position, -1L);
     }
 
+    public void ack(Position position, Long seqId) throws CanalStoreException {
+        cleanUntil(position, seqId);
+    }
+
+    @Override
     public void cleanUntil(Position position) throws CanalStoreException {
+        cleanUntil(position, -1L);
+    }
+
+    public void cleanUntil(Position position, Long seqId) throws CanalStoreException {
         final ReentrantLock lock = this.lock;
         lock.lock();
         try {
@@ -421,6 +435,9 @@ public class MemoryEventStoreWithBuffer extends AbstractCanalStoreScavenge imple
             // ack没有list，但有已存在的foreach，还是节省一下list的开销
             long localExecTime = 0L;
             int deltaRows = 0;
+            if (seqId > 0) {
+                maxSequence = seqId;
+            }
             for (long next = sequence + 1; next <= maxSequence; next++) {
                 Event event = entries[getIndex(next)];
                 if (localExecTime == 0 && event.getExecuteTime() > 0) {
@@ -428,8 +445,8 @@ public class MemoryEventStoreWithBuffer extends AbstractCanalStoreScavenge imple
                 }
                 deltaRows += event.getRowsCount();
                 memsize += calculateSize(event);
-                boolean match = CanalEventUtils.checkPosition(event, (LogPosition) position);
-                if (match) {// 找到对应的position，更新ack seq
+                if ((seqId < 0 || next == seqId) && CanalEventUtils.checkPosition(event, (LogPosition) position)) {
+                    // 找到对应的position，更新ack seq
                     hasMatch = true;
 
                     if (batchMode.isMemSize()) {
@@ -438,6 +455,12 @@ public class MemoryEventStoreWithBuffer extends AbstractCanalStoreScavenge imple
                         for (long index = sequence + 1; index < next; index++) {
                             entries[getIndex(index)] = null;// 设置为null
                         }
+
+                        // 考虑getFirstPosition/getLastPosition会获取最后一次ack的position信息
+                        // ack清理的时候只处理entry=null，释放内存
+                        Event lastEvent = entries[getIndex(next)];
+                        lastEvent.setEntry(null);
+                        lastEvent.setRawEntry(null);
                     }
 
                     if (ackSequence.compareAndSet(sequence, next)) {// 避免并发ack
@@ -625,6 +648,14 @@ public class MemoryEventStoreWithBuffer extends AbstractCanalStoreScavenge imple
         this.ddlIsolation = ddlIsolation;
     }
 
+    public boolean isRaw() {
+        return raw;
+    }
+
+    public void setRaw(boolean raw) {
+        this.raw = raw;
+    }
+
     public AtomicLong getPutSequence() {
         return putSequence;
     }
@@ -668,4 +699,5 @@ public class MemoryEventStoreWithBuffer extends AbstractCanalStoreScavenge imple
     public AtomicLong getAckTableRows() {
         return ackTableRows;
     }
+
 }

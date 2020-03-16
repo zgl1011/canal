@@ -1,13 +1,18 @@
 package com.alibaba.otter.canal.instance.manager;
 
+import java.io.File;
+import java.io.FilenameFilter;
 import java.net.InetSocketAddress;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
-import com.alibaba.otter.canal.meta.FileMixedMetaManager;
+import org.apache.commons.lang.BooleanUtils;
 import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang.exception.ExceptionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.util.CollectionUtils;
@@ -39,7 +44,16 @@ import com.alibaba.otter.canal.parse.inbound.AbstractEventParser;
 import com.alibaba.otter.canal.parse.inbound.group.GroupEventParser;
 import com.alibaba.otter.canal.parse.inbound.mysql.LocalBinlogEventParser;
 import com.alibaba.otter.canal.parse.inbound.mysql.MysqlEventParser;
-import com.alibaba.otter.canal.parse.index.*;
+import com.alibaba.otter.canal.parse.inbound.mysql.rds.RdsBinlogEventParserProxy;
+import com.alibaba.otter.canal.parse.inbound.mysql.tsdb.DefaultTableMetaTSDBFactory;
+import com.alibaba.otter.canal.parse.inbound.mysql.tsdb.TableMetaTSDB;
+import com.alibaba.otter.canal.parse.inbound.mysql.tsdb.TableMetaTSDBBuilder;
+import com.alibaba.otter.canal.parse.index.CanalLogPositionManager;
+import com.alibaba.otter.canal.parse.index.FailbackLogPositionManager;
+import com.alibaba.otter.canal.parse.index.MemoryLogPositionManager;
+import com.alibaba.otter.canal.parse.index.MetaLogPositionManager;
+import com.alibaba.otter.canal.parse.index.PeriodMixedLogPositionManager;
+import com.alibaba.otter.canal.parse.index.ZooKeeperLogPositionManager;
 import com.alibaba.otter.canal.parse.support.AuthenticationInfo;
 import com.alibaba.otter.canal.protocol.position.EntryPosition;
 import com.alibaba.otter.canal.sink.entry.EntryEventSink;
@@ -50,7 +64,7 @@ import com.alibaba.otter.canal.store.model.BatchMode;
 
 /**
  * 单个canal实例，比如一个destination会独立一个实例
- * 
+ *
  * @author jianghang 2012-7-11 下午09:26:51
  * @version 1.0.0
  */
@@ -95,9 +109,45 @@ public class CanalInstanceWithManager extends AbstractCanalInstance {
         super.start();
     }
 
+    @SuppressWarnings("resource")
     protected void initAlarmHandler() {
         logger.info("init alarmHandler begin...");
-        alarmHandler = new LogAlarmHandler();
+        String alarmHandlerClass = parameters.getAlarmHandlerClass();
+        String alarmHandlerPluginDir = parameters.getAlarmHandlerPluginDir();
+        if (alarmHandlerClass == null || alarmHandlerPluginDir == null) {
+            alarmHandler = new LogAlarmHandler();
+        } else {
+            try {
+                File externalLibDir = new File(alarmHandlerPluginDir);
+                File[] jarFiles = externalLibDir.listFiles(new FilenameFilter() {
+
+                    @Override
+                    public boolean accept(File dir, String name) {
+                        return name.endsWith(".jar");
+                    }
+                });
+                if (jarFiles == null || jarFiles.length == 0) {
+                    throw new IllegalStateException(String.format("alarmHandlerPluginDir [%s] can't find any name endswith \".jar\" file.",
+                        alarmHandlerPluginDir));
+                }
+                URL[] urls = new URL[jarFiles.length];
+                for (int i = 0; i < jarFiles.length; i++) {
+                    urls[i] = jarFiles[i].toURI().toURL();
+                }
+                ClassLoader currentClassLoader = new URLClassLoader(urls,
+                    CanalInstanceWithManager.class.getClassLoader());
+                Class<CanalAlarmHandler> _alarmClass = (Class<CanalAlarmHandler>) currentClassLoader.loadClass(alarmHandlerClass);
+                alarmHandler = _alarmClass.newInstance();
+                logger.info("init [{}] alarm handler success.", alarmHandlerClass);
+            } catch (Throwable e) {
+                String errorMsg = String.format("init alarmHandlerPluginDir [%s] alarm handler [%s] error: %s",
+                    alarmHandlerPluginDir,
+                    alarmHandlerClass,
+                    ExceptionUtils.getFullStackTrace(e));
+                logger.error(errorMsg);
+                throw new CanalException(errorMsg, e);
+            }
+        }
         logger.info("init alarmHandler end! \n\t load CanalAlarmHandler:{} ", alarmHandler.getClass().getName());
     }
 
@@ -138,6 +188,7 @@ public class CanalInstanceWithManager extends AbstractCanalInstance {
             memoryEventStore.setBufferMemUnit(parameters.getMemoryStorageBufferMemUnit());
             memoryEventStore.setBatchMode(BatchMode.valueOf(parameters.getStorageBatchMode().name()));
             memoryEventStore.setDdlIsolation(parameters.getDdlIsolation());
+            memoryEventStore.setRaw(parameters.getMemoryStorageRawEntry());
             eventStore = memoryEventStore;
         } else if (mode.isFile()) {
             // 后续版本支持
@@ -229,7 +280,18 @@ public class CanalInstanceWithManager extends AbstractCanalInstance {
     private CanalEventParser doInitEventParser(SourcingType type, List<InetSocketAddress> dbAddresses) {
         CanalEventParser eventParser;
         if (type.isMysql()) {
-            MysqlEventParser mysqlEventParser = new MysqlEventParser();
+            MysqlEventParser mysqlEventParser = null;
+            if (StringUtils.isNotEmpty(parameters.getRdsAccesskey())
+                && StringUtils.isNotEmpty(parameters.getRdsSecretkey())
+                && StringUtils.isNotEmpty(parameters.getRdsInstanceId())) {
+
+                mysqlEventParser = new RdsBinlogEventParserProxy();
+                ((RdsBinlogEventParserProxy) mysqlEventParser).setAccesskey(parameters.getRdsAccesskey());
+                ((RdsBinlogEventParserProxy) mysqlEventParser).setSecretkey(parameters.getRdsSecretkey());
+                ((RdsBinlogEventParserProxy) mysqlEventParser).setInstanceId(parameters.getRdsInstanceId());
+            } else {
+                mysqlEventParser = new MysqlEventParser();
+            }
             mysqlEventParser.setDestination(destination);
             // 编码参数
             mysqlEventParser.setConnectionCharset(Charset.forName(parameters.getConnectionCharset()));
@@ -273,6 +335,41 @@ public class CanalInstanceWithManager extends AbstractCanalInstance {
             mysqlEventParser.setFallbackIntervalInSeconds(parameters.getFallbackIntervalInSeconds());
             mysqlEventParser.setProfilingEnabled(false);
             mysqlEventParser.setFilterTableError(parameters.getFilterTableError());
+            mysqlEventParser.setParallel(parameters.getParallel());
+            mysqlEventParser.setIsGTIDMode(BooleanUtils.toBoolean(parameters.getGtidEnable()));
+            // tsdb
+            if (parameters.getTsdbSnapshotInterval() != null) {
+                mysqlEventParser.setTsdbSnapshotInterval(parameters.getTsdbSnapshotInterval());
+            }
+            if (parameters.getTsdbSnapshotExpire() != null) {
+                mysqlEventParser.setTsdbSnapshotExpire(parameters.getTsdbSnapshotExpire());
+            }
+            boolean tsdbEnable = BooleanUtils.toBoolean(parameters.getTsdbEnable());
+            if (tsdbEnable) {
+                mysqlEventParser.setTableMetaTSDBFactory(new DefaultTableMetaTSDBFactory() {
+
+                    @Override
+                    public void destory(String destination) {
+                        TableMetaTSDBBuilder.destory(destination);
+                    }
+
+                    @Override
+                    public TableMetaTSDB build(String destination, String springXml) {
+                        try {
+                            System.setProperty("canal.instance.tsdb.url", parameters.getTsdbJdbcUrl());
+                            System.setProperty("canal.instance.tsdb.dbUsername", parameters.getTsdbJdbcUserName());
+                            System.setProperty("canal.instance.tsdb.dbPassword", parameters.getTsdbJdbcPassword());
+
+                            return TableMetaTSDBBuilder.build(destination, "classpath:spring/tsdb/mysql-tsdb.xml");
+                        } finally {
+                            System.setProperty("canal.instance.tsdb.url", "");
+                            System.setProperty("canal.instance.tsdb.dbUsername", "");
+                            System.setProperty("canal.instance.tsdb.dbPassword", "");
+                        }
+                    }
+                });
+                mysqlEventParser.setEnableTsdb(tsdbEnable);
+            }
             eventParser = mysqlEventParser;
         } else if (type.isLocalBinlog()) {
             LocalBinlogEventParser localBinlogEventParser = new LocalBinlogEventParser();
@@ -285,14 +382,15 @@ public class CanalInstanceWithManager extends AbstractCanalInstance {
             localBinlogEventParser.setDetectingEnable(parameters.getDetectingEnable());
             localBinlogEventParser.setDetectingIntervalInSeconds(parameters.getDetectingIntervalInSeconds());
             localBinlogEventParser.setFilterTableError(parameters.getFilterTableError());
+            localBinlogEventParser.setParallel(parameters.getParallel());
             // 数据库信息，反查表结构时需要
             if (!CollectionUtils.isEmpty(dbAddresses)) {
                 localBinlogEventParser.setMasterInfo(new AuthenticationInfo(dbAddresses.get(0),
                     parameters.getDbUsername(),
                     parameters.getDbPassword(),
                     parameters.getDefaultDatabaseName()));
-
             }
+
             eventParser = localBinlogEventParser;
         } else if (type.isOracle()) {
             throw new CanalException("unsupport SourcingType for " + type);

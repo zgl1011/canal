@@ -20,6 +20,7 @@ import com.alibaba.otter.canal.sink.CanalEventDownStreamHandler;
 import com.alibaba.otter.canal.sink.CanalEventSink;
 import com.alibaba.otter.canal.sink.exception.CanalSinkException;
 import com.alibaba.otter.canal.store.CanalEventStore;
+import com.alibaba.otter.canal.store.memory.MemoryEventStoreWithBuffer;
 import com.alibaba.otter.canal.store.model.Event;
 
 /**
@@ -42,7 +43,8 @@ public class EntryEventSink extends AbstractCanalEventSink<List<CanalEntry.Entry
     protected AtomicLong           lastTransactionCount          = new AtomicLong(0L);
     protected volatile long        lastEmptyTransactionTimestamp = 0L;
     protected AtomicLong           lastEmptyTransactionCount     = new AtomicLong(0L);
-    private AtomicLong             eventsSinkBlockingTime        = new AtomicLong(0L);
+    protected AtomicLong           eventsSinkBlockingTime        = new AtomicLong(0L);
+    protected boolean              raw;
 
     public EntryEventSink(){
         addHandler(new HeartBeatEntryEventHandler());
@@ -51,6 +53,10 @@ public class EntryEventSink extends AbstractCanalEventSink<List<CanalEntry.Entry
     public void start() {
         super.start();
         Assert.notNull(eventStore);
+
+        if (eventStore instanceof MemoryEventStoreWithBuffer) {
+            this.raw = ((MemoryEventStoreWithBuffer) eventStore).isRaw();
+        }
 
         for (CanalEventDownStreamHandler handler : getHandlers()) {
             if (!handler.isStart()) {
@@ -94,17 +100,18 @@ public class EntryEventSink extends AbstractCanalEventSink<List<CanalEntry.Entry
                 && (entry.getEntryType() == EntryType.TRANSACTIONBEGIN || entry.getEntryType() == EntryType.TRANSACTIONEND)) {
                 long currentTimestamp = entry.getHeader().getExecuteTime();
                 // 基于一定的策略控制，放过空的事务头和尾，便于及时更新数据库位点，表明工作正常
-                if (Math.abs(currentTimestamp - lastTransactionTimestamp) > emptyTransactionInterval
-                    || lastTransactionCount.incrementAndGet() > emptyTransctionThresold) {
+                if (lastTransactionCount.incrementAndGet() <= emptyTransctionThresold
+                    && Math.abs(currentTimestamp - lastTransactionTimestamp) <= emptyTransactionInterval) {
+                    continue;
+                } else {
                     lastTransactionCount.set(0L);
                     lastTransactionTimestamp = currentTimestamp;
-                    continue;
                 }
             }
 
             hasRowData |= (entry.getEntryType() == EntryType.ROWDATA);
             hasHeartBeat |= (entry.getEntryType() == EntryType.HEARTBEAT);
-            Event event = new Event(new LogIdentity(remoteAddress, -1L), entry);
+            Event event = new Event(new LogIdentity(remoteAddress, -1L), entry, raw);
             events.add(event);
         }
 

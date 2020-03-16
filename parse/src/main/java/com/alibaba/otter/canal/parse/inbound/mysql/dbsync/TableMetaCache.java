@@ -39,6 +39,7 @@ public class TableMetaCache {
     public static final String              EXTRA          = "EXTRA";
     private MysqlConnection                 connection;
     private boolean                         isOnRDS        = false;
+    private boolean                         isOnTSDB       = false;
 
     private TableMetaTSDB                   tableMetaTSDB;
     // 第一层tableId,第二层schema.table,解决tableId重复，对应多张表
@@ -67,6 +68,8 @@ public class TableMetaCache {
                 }
 
             });
+        } else {
+            isOnTSDB = true;
         }
 
         try {
@@ -78,7 +81,7 @@ public class TableMetaCache {
         }
     }
 
-    private TableMeta getTableMetaByDB(String fullname) throws IOException {
+    private synchronized TableMeta getTableMetaByDB(String fullname) throws IOException {
         try {
             ResultSetPacket packet = connection.query("show create table " + fullname);
             String[] names = StringUtils.split(fullname, "`.`");
@@ -156,16 +159,23 @@ public class TableMetaCache {
         return getTableMeta(schema, table, true, position);
     }
 
-    public TableMeta getTableMeta(String schema, String table, boolean useCache, EntryPosition position) {
+    public synchronized TableMeta getTableMeta(String schema, String table, boolean useCache, EntryPosition position) {
         TableMeta tableMeta = null;
         if (tableMetaTSDB != null) {
             tableMeta = tableMetaTSDB.find(schema, table);
             if (tableMeta == null) {
                 // 因为条件变化，可能第一次的tableMeta没取到，需要从db获取一次，并记录到snapshot中
                 String fullName = getFullName(schema, table);
+                ResultSetPacket packet = null;
+                String createDDL = null;
                 try {
-                    ResultSetPacket packet = connection.query("show create table " + fullName);
-                    String createDDL = null;
+                    try {
+                        packet = connection.query("show create table " + fullName);
+                    } catch (Exception e) {
+                        // 尝试做一次retry操作
+                        connection.reconnect();
+                        packet = connection.query("show create table " + fullName);
+                    }
                     if (packet.getFieldValues().size() > 0) {
                         createDDL = packet.getFieldValues().get(1);
                     }
@@ -242,6 +252,15 @@ public class TableMetaCache {
             .append(table)
             .append('`')
             .toString();
+    }
+
+
+    public boolean isOnTSDB() {
+        return isOnTSDB;
+    }
+
+    public void setOnTSDB(boolean isOnTSDB) {
+        this.isOnTSDB = isOnTSDB;
     }
 
     public boolean isOnRDS() {
